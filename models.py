@@ -57,10 +57,14 @@ class LSTMEncoder(torch.nn.Module):
         outputs = outputs[inputs_unsorted_idx]
         h = h[inputs_unsorted_idx]
 
+        return outputs, h
+
+        '''
         if self.return_sequence:
             return outputs
         else:
             return h
+        '''
 
 
 class Squeeze(torch.nn.Module):
@@ -138,10 +142,11 @@ class Seq2Seq(torch.nn.Module):
         if not trainable_embeddings:
             self.embedding.weight.requires_grad = False
 
-        self.encoder = LSTMEncoder(embedding_size, hidden_size, dropout)
+        # self.encoder = LSTMEncoder(embedding_size, hidden_size, dropout)
+        self.encoder = LSTMEncoder(embedding_size, hidden_size, dropout, return_sequence=True)
         self.decoder_cell = torch.nn.LSTMCell(embedding_size, hidden_size)
         self.output_projection = torch.nn.Linear(hidden_size, vocab_size)
-
+        
         self._xent_loss = SequenceReconstructionLoss(ignore_index=pad_index)
 
     def encode(self, inputs):
@@ -155,36 +160,59 @@ class Seq2Seq(torch.nn.Module):
         sentence_emb = self.embedding(sentence)
 
         # shape: (batch_size, hidden_size)
-        decoder_hidden = self.encoder(sentence_emb, lengths)
+        decoder_hidden, last_hidden = self.encoder(sentence_emb, lengths)
+
+        #import pdb; pdb.set_trace()
 
         output_dict = {
-            'decoder_hidden': decoder_hidden
+            'decoder_hidden': decoder_hidden,
+            'last_hidden': last_hidden
         }
 
         return output_dict
 
-    def decode(self, state, targets=None):
+    def decode(self, state, meaning_transformer, meaning_style_hidden, att_projection, targets=None):
         # shape: (batch_size, hidden_size)
-        decoder_hidden = state['decoder_hidden']
-        decoder_cell = torch.zeros_like(decoder_hidden)
+        # import pdb; pdb.set_trace()
+        # decoder_hidden = state['decoder_hidden']
+        encoder_hidden = state['decoder_hidden']
+        decoder_cell = torch.zeros_like(encoder_hidden[:,-1,:])
+        encoder_hidden = att_projection(encoder_hidden)
 
-        batch_size = decoder_hidden.size(0)
+        batch_size = encoder_hidden.size(0)
 
         if targets is not None:
+            inputs = targets
+            targets = inputs['sentence']
             num_decoding_steps = targets.size(1)
         else:
             num_decoding_steps = self.max_len
 
         # shape: (batch_size, )
-        last_predictions = decoder_hidden.new_full((batch_size,), fill_value=self.start_index).long()
+        # last_predictions = decoder_hidden.new_full((batch_size,), fill_value=self.start_index).long()
         # shape: (batch_size, sequence_len, vocab_size)
         step_logits = []
         # shape: (batch_size, sequence_len, )
         step_predictions = []
-
+        step_meanings = [state['meaning_hidden']]
+        # step_style_for_meaning = []
+        
         for timestep in range(num_decoding_steps):
+            # make new meaning tensor and new decoder_hidden
+            # print('encoder_hidden: ', encoder_hidden.shape)
+            # print('step_meanings[-1]: ', step_meanings[-1].shape)
+            e_t = torch.bmm(encoder_hidden, step_meanings[-1].unsqueeze(2)).squeeze(2)
+            alpha_t = torch.softmax(e_t, dim=1)
+            a_t = torch.bmm(torch.unsqueeze(alpha_t, 1), encoder_hidden).squeeze(1)
+            # step_meanings.append(a_t)
+            decoder_hidden = torch.cat([a_t, state['style_hidden']], dim=-1)
+            decoder_hidden = meaning_style_hidden(decoder_hidden)
+
             # Use gold tokens at test time and at a rate of 1 - _scheduled_sampling_ratio during training.
             # shape: (batch_size,)
+            if timestep == 0:
+                last_predictions = decoder_hidden.new_full((batch_size,), fill_value=self.start_index).long()
+
             decoder_input = last_predictions
             if timestep > 0 and self.training and torch.rand(1).item() > self.scheduled_sampling_ratio:
                 decoder_input = targets[:, timestep - 1]
@@ -194,6 +222,8 @@ class Seq2Seq(torch.nn.Module):
 
             # shape: (batch_size, hidden_size)
             decoder_hidden, decoder_cell = self.decoder_cell(decoder_input, (decoder_hidden, decoder_cell))
+
+            step_meanings.append(meaning_transformer(decoder_hidden))
 
             # shape: (batch_size, vocab_size)
             output_projection = self.output_projection(decoder_hidden)
@@ -211,6 +241,12 @@ class Seq2Seq(torch.nn.Module):
         logits = torch.cat(step_logits, 1)
         # shape: (batch_size, max_len)
         predictions = torch.cat(step_predictions, 1)
+        # import pdb; pdb.set_trace()
+        state['meaning_hidden'] = torch.cat(step_meanings[:-1], 0)
+        if targets is not None:
+            inputs['style_for_meaning'] = inputs['style'].repeat(num_decoding_steps)
+            if 'meaning_embedding' in inputs:
+                inputs['meaning_embedding_for_meaning'] = inputs['meaning_embedding'].repeat(num_decoding_steps, 1)
 
         state.update({
             "logits": logits,
@@ -233,7 +269,7 @@ class Seq2Seq(torch.nn.Module):
 
     def forward(self, inputs):
         state = self.encode(inputs)
-        output_dict = self.decode(state, inputs['sentence'])
+        output_dict = self.decode(state, inputs)
 
         output_dict = self.calc_loss(output_dict, inputs)
 
@@ -248,6 +284,7 @@ class Seq2SeqMeaningStyle(Seq2Seq):
         self.style_size = style_size
         self.nb_styles = nb_styles
 
+        self.att_projection = torch.nn.Linear(self.hidden_size, self.meaning_size, bias=False)
         self.hidden_meaning = SpaceTransformer(self.hidden_size, self.meaning_size, self.dropout)
         self.hidden_style = SpaceTransformer(self.hidden_size, self.meaning_size, self.dropout)
         self.meaning_style_hidden = SpaceTransformer(meaning_size + style_size, self.hidden_size, self.dropout)
@@ -280,19 +317,32 @@ class Seq2SeqMeaningStyle(Seq2Seq):
         state = super().encode(inputs)
 
         # shape: (batch_size, hidden_size)
-        decoder_hidden = state['decoder_hidden']
+        # decoder_hidden = state['decoder_hidden']
+        last_hidden = state['last_hidden']
 
         # shape: (batch_size, hidden_size)
-        meaning_hidden = self.hidden_meaning(decoder_hidden)
+        meaning_hidden = self.hidden_meaning(last_hidden)
 
         # shape: (batch_size, hidden_size)
-        style_hidden = self.hidden_style(decoder_hidden)
+        style_hidden = self.hidden_style(last_hidden)
 
         state['meaning_hidden'] = meaning_hidden
         state['style_hidden'] = style_hidden
 
         return state
+    
+    def combine_meaning_style(self, state):
+        # shape: (batch_size, hidden_size * 2)
+        decoder_hidden = torch.cat([state['meaning_hidden'], state['style_hidden']], dim=-1)
 
+        # shape: (batch_size, hidden_size)
+        decoder_hidden = self.meaning_style_hidden(decoder_hidden)
+
+        #state['decoder_hidden'] = decoder_hidden
+
+        return decoder_hidden
+
+    '''
     def combine_meaning_style(self, state):
         # shape: (batch_size, hidden_size * 2)
         decoder_hidden = torch.cat([state['meaning_hidden'], state['style_hidden']], dim=-1)
@@ -303,19 +353,20 @@ class Seq2SeqMeaningStyle(Seq2Seq):
         state['decoder_hidden'] = decoder_hidden
 
         return state
-
+    '''
     def decode(self, state, targets=None):
-        state = self.combine_meaning_style(state)
+        # state = self.combine_meaning_style(state)
 
-        output_dict = super().decode(state, targets)
+        output_dict = super().decode(state, self.hidden_meaning, self.meaning_style_hidden, self.att_projection, targets)
         return output_dict
 
     def calc_discriminator_loss(self, output_dict, inputs):
-        output_dict['loss_D_meaning'] = self._D_loss(output_dict['D_meaning_logits'], inputs['style'])
+        # import pdb; pdb.set_trace()
+        output_dict['loss_D_meaning'] = self._D_loss(output_dict['D_meaning_logits'], inputs['style_for_meaning'])
         output_dict['loss_D_style'] = self._D_loss(output_dict['D_style_logits'], inputs['style'])
 
         if 'meaning_embedding' in inputs:
-            output_dict['loss_P_meaning'] = self._P_loss(output_dict['P_meaning'], inputs['meaning_embedding'])
+            output_dict['loss_P_meaning'] = self._P_loss(output_dict['P_meaning'], inputs['meaning_embedding_for_meaning'])
             output_dict['loss_P_style'] = self._P_loss(output_dict['P_style'], inputs['meaning_embedding'])
 
         if 'meaning_bow' in inputs:
@@ -329,7 +380,7 @@ class Seq2SeqMeaningStyle(Seq2Seq):
         output_dict['loss_D_adv_style'] = self._D_loss(output_dict['D_style_logits'], inputs['style'])
 
         if 'meaning_embedding' in inputs:
-            output_dict['loss_P_adv_meaning'] = self._P_loss(output_dict['P_meaning'], inputs['meaning_embedding'])
+            output_dict['loss_P_adv_meaning'] = self._P_loss(output_dict['P_meaning'], inputs['meaning_embedding_for_meaning'])
             output_dict['loss_P_adv_style'] = self._P_adv_loss(output_dict['P_style'])
 
         if 'meaning_bow' in inputs:
@@ -340,6 +391,7 @@ class Seq2SeqMeaningStyle(Seq2Seq):
         return output_dict
 
     def discriminate(self, output_dict, inputs, adversarial=False):
+        # import pdb; pdb.set_trace()
         output_dict['D_meaning_logits'] = self.D_meaning(output_dict['meaning_hidden'])
         output_dict['D_style_logits'] = self.D_style(output_dict['style_hidden'])
 

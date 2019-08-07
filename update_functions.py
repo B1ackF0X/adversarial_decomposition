@@ -4,6 +4,9 @@ import itertools
 import torch
 
 from utils import to_device
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter(comment='_ADNet_model_with_fixed_loss_for_mlp')
 
 
 class UpdateFunction(object):
@@ -121,9 +124,10 @@ class Seq2SeqMeaningStyleUpdateFunction(UpdateFunction):
         losses_output_dict = {}
 
         # discriminator
-        state = self.model.encode(batch)
+        state = self.model(batch)
+        # import pdb; pdb.set_trace()
         output_dict_D = self.model.discriminate(state, batch)
-
+        
         if self.use_discriminator:
             loss_D_meaning = output_dict_D['loss_D_meaning']
             losses_output_dict['loss_D_meaning'] = float(loss_D_meaning.item())
@@ -192,6 +196,7 @@ class Seq2SeqMeaningStyleUpdateFunction(UpdateFunction):
 
         # encoder-decoder
         if not self.training or engine.state.iteration % self.D_num_iterations == 0:
+            # import pdb; pdb.set_trace()
             output_dict = self.model(batch)
             output_dict = self.model.discriminate(output_dict, batch, adversarial=True)
 
@@ -239,12 +244,15 @@ class Seq2SeqMeaningStyleUpdateFunction(UpdateFunction):
             else:
                 loss_D_adv_hidden = 0
 
-            loss_total = loss
+            loss_total = loss + loss_D_adv_meaning + loss_D_adv_style
+
+            # writer.add_scalar('loss/autoencoder', loss_total, global_step=train_iter)
+            '''
             if loss_D_meaning <= 0.35:
                 loss_total += self.D_loss_multiplier * loss_D_adv_meaning
             if loss_D_style <= 0.35:
                 loss_total += self.D_loss_multiplier * loss_D_adv_style
-
+            '''
             if loss_P_style < 2.5e-3:
                 loss_total += self.P_loss_multiplier * loss_P_adv_style
             if loss_P_meaning < 2.5e-3:
